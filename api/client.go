@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -36,16 +37,17 @@ type Client struct {
 }
 
 var (
-	ErrApiServer           = errors.New("api server error")
-	ErrApiClient           = errors.New("api client error")
-	ErrApiForbidden        = errors.New("api client forbidden")
-	ErrApiInvalidResponse  = errors.New("api server gave an invalid response")
+	ErrApiServer           = fmt.Errorf("api server error")
+	ErrApiClient           = fmt.Errorf("api client error")
+	ErrApiForbidden        = fmt.Errorf("api client forbidden")
+	ErrApiRevoked          = fmt.Errorf("api client revoked")
+	ErrApiInvalidResponse  = fmt.Errorf("api server gave an invalid response")
 	ErrDeviceAlreadyJoined = errors.Wrap(ErrApiClient, "device already joined")
 )
 
 func RetryableError(err error) error {
 	if errors.Is(err, ErrApiClient) {
-		return &backoff.PermanentError{Err: err}
+		return backoff.Permanent(err)
 	}
 	return err
 }
@@ -92,6 +94,8 @@ func (c *Client) Response(resp *http.Response, v interface{}) error {
 			// It's not you it's me
 			if resp.StatusCode == 403 {
 				return errors.Wrapf(ErrApiForbidden, "request failed: HTTP %d: %s", resp.StatusCode, string(respContents))
+			} else if resp.StatusCode == 410 {
+				return errors.Wrapf(ErrApiRevoked, "request failed: HTTP %d: %s", resp.StatusCode, string(respContents))
 			} else {
 				return errors.Wrapf(ErrApiClient, "request failed: HTTP %d: %s", resp.StatusCode, string(respContents))
 			}
@@ -226,4 +230,17 @@ func (c *Client) GetSubscriptionToken(ctx context.Context, plan string) (*GetSub
 		return nil, errors.Wrap(err, "failed to decode response")
 	}
 	return &subTokenResp, nil
+}
+
+func (c *Client) ListSubscriptions(ctx context.Context) (*ListSubscriptionsResponse, error) {
+	resp, err := c.Request(ctx, "GET", "/v1/subscription", nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "request failed")
+	}
+	var listSubsResp ListSubscriptionsResponse
+	err = c.Response(resp, &listSubsResp)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to decode response")
+	}
+	return &listSubsResp, nil
 }

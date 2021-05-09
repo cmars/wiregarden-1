@@ -15,15 +15,13 @@ import (
 	"net"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/wiregarden-io/wiregarden/api"
 	"github.com/wiregarden-io/wiregarden/wireguard"
 )
 
 var (
-	ErrInterfaceStatePending     = errors.New("interface state has not been applied")
-	ErrInterfaceOperationInvalid = errors.New("operation not valid for interface state")
+	ErrInterfaceStatePending     = fmt.Errorf("interface state has not been applied")
+	ErrInterfaceOperationInvalid = fmt.Errorf("operation not valid for interface state")
 )
 
 type Interface struct {
@@ -42,6 +40,8 @@ func (iface *Interface) Name() string {
 	return fmt.Sprintf("wgn%03d", iface.Id)
 }
 
+const defaultMTUSize = 1280
+
 func (iface *Interface) Config() *wireguard.InterfaceConfig {
 	isServer := iface.Device.Endpoint != ""
 	var postUp string
@@ -55,6 +55,7 @@ func (iface *Interface) Config() *wireguard.InterfaceConfig {
 		PrivateKey: iface.Key,
 		PostUp:     postUp,
 		Peers:      peersModel(iface.Peers).Config(&iface.Network, iface.Device.Endpoint != ""),
+		MTU:        defaultMTUSize,
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -32,16 +33,18 @@ var (
 	ErrInterfaceStateChanging = errors.New("interface state changed during operation")
 	ErrInterfaceStateInvalid  = errors.New("invalid interface state")
 	ErrDeviceNotFound         = errors.New("device not found")
+	ErrWritePermissions       = errors.New("no write permissions")
 )
 
 type Agent struct {
 	dataDir string
 	apiUrl  string
 
-	st     *store.Store
-	newApi func(string) Client
-	nm     NetworkManager
-	wc     *watcherClient
+	st       *store.Store
+	newApi   func(string) Client
+	nm       NetworkManager
+	wc       *watcherClient
+	readOnly bool
 }
 
 type Params struct {
@@ -49,6 +52,7 @@ type Params struct {
 	ApiUrl    string
 	StorePath string
 	StoreKey  store.Key
+	ReadOnly  bool
 }
 
 type Client interface {
@@ -72,16 +76,23 @@ func New(dataDir, apiUrl string, options ...AgentOption) (*Agent, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	st, err := store.New(p.StorePath, p.StoreKey)
+
+	var st *store.Store
+	if p.ReadOnly {
+		st, err = store.NewReadOnly(p.StorePath)
+	} else {
+		st, err = store.New(p.StorePath, p.StoreKey)
+	}
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	a := &Agent{
-		dataDir: p.DataDir,
-		apiUrl:  p.ApiUrl,
-		st:      st,
-		newApi:  func(apiUrl string) Client { return newRetryClient(api.New(apiUrl), nil) },
-		nm:      &wireguardManager{dataDir: p.DataDir},
+		dataDir:  p.DataDir,
+		apiUrl:   p.ApiUrl,
+		st:       st,
+		newApi:   func(apiUrl string) Client { return newRetryClient(api.New(apiUrl), nil) },
+		nm:       &wireguardManager{dataDir: p.DataDir},
+		readOnly: p.ReadOnly,
 	}
 	for _, opt := range options {
 		opt(a)
@@ -90,10 +101,16 @@ func New(dataDir, apiUrl string, options ...AgentOption) (*Agent, error) {
 }
 
 func NotifyWatcher(a *Agent) {
-	a.wc = &watcherClient{}
+	a.wc = newWatcherClient()
 }
 
-const defaultDataDir = "/var/lib/wiregarden"
+var defaultDataDir = "/var/lib/wiregarden"
+
+func init() {
+	if snapCommon := os.Getenv("SNAP_COMMON"); snapCommon != "" {
+		defaultDataDir = snapCommon + "/data"
+	}
+}
 
 func defaultParams(dataDir, apiUrl string) (Params, error) {
 	if dataDir == "" {
@@ -102,25 +119,32 @@ func defaultParams(dataDir, apiUrl string) (Params, error) {
 	if apiUrl == "" {
 		apiUrl = api.DefaultApiUrl
 	}
+	var readOnly bool
 	err := checkDataDir(dataDir)
 	if err != nil {
-		return Params{}, errors.WithStack(err)
+		if os.IsPermission(errors.Cause(err)) {
+			readOnly = true
+		} else {
+			return Params{}, errors.WithStack(err)
+		}
 	}
 	storePath := filepath.Join(dataDir, "db")
 	var storeKey store.Key
-	if storeKeyEnv := os.Getenv("WIREGARDEN_STORE_KEY"); storeKeyEnv != "" {
-		buf, err := base64.StdEncoding.DecodeString(storeKeyEnv)
-		if err != nil {
-			return Params{}, errors.Wrap(err, "invalid store key")
-		}
-		if len(buf) != len(storeKey) {
-			return Params{}, errors.New("invalid store key")
-		}
-		copy(storeKey[:], buf[:])
-	} else {
-		storeKey, err = ensureStoreKey(filepath.Join(dataDir, "db.key"))
-		if err != nil {
-			return Params{}, errors.WithStack(err)
+	if !readOnly {
+		if storeKeyEnv := os.Getenv("WIREGARDEN_STORE_KEY"); storeKeyEnv != "" {
+			buf, err := base64.StdEncoding.DecodeString(storeKeyEnv)
+			if err != nil {
+				return Params{}, errors.Wrap(err, "invalid store key")
+			}
+			if len(buf) != len(storeKey) {
+				return Params{}, errors.New("invalid store key")
+			}
+			copy(storeKey[:], buf[:])
+		} else {
+			storeKey, err = ensureStoreKey(filepath.Join(dataDir, "db.key"))
+			if err != nil {
+				return Params{}, errors.WithStack(err)
+			}
 		}
 	}
 	return Params{
@@ -128,13 +152,18 @@ func defaultParams(dataDir, apiUrl string) (Params, error) {
 		ApiUrl:    apiUrl,
 		StorePath: storePath,
 		StoreKey:  storeKey,
+		ReadOnly:  readOnly,
 	}, nil
 }
 
 func checkDataDir(dataDir string) error {
-	err := os.MkdirAll(dataDir, 0700)
+	err := os.MkdirAll(dataDir, 0755)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create data directory %q", dataDir)
+	}
+	err = os.Chmod(dataDir, 0755)
+	if err != nil {
+		return errors.Wrapf(err, "failed to set permissions on data directory %q", dataDir)
 	}
 	check := dataDir + "/.check"
 	f, err := os.Create(check)
@@ -182,28 +211,53 @@ func generateStoreKey(keyPath string) (store.Key, error) {
 	return k, nil
 }
 
-func (a *Agent) JoinDevice(ctx context.Context, deviceName, networkName, endpoint string) (*store.Interface, error) {
+type JoinArgs struct {
+	Name     string
+	Network  string
+	Endpoint string
+	Address  string
+}
+
+func (a *Agent) JoinDevice(ctx context.Context, args JoinArgs) (*store.Interface, error) {
+	if a.readOnly {
+		return nil, errors.WithStack(ErrWritePermissions)
+	}
 	var err error
-	if deviceName == "" {
-		deviceName, err = os.Hostname()
+	if args.Name == "" {
+		args.Name, err = os.Hostname()
 		if err != nil {
 			return nil, errors.Wrap(err, "cannot determine hostname, node name is required")
 		}
 	}
 
-	if networkName == "" {
-		networkName = "default"
+	if args.Network == "" {
+		args.Network = "default"
+	}
+
+	if args.Endpoint != "" {
+		_, _, err := net.SplitHostPort(args.Endpoint)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid endpoint %q", args.Endpoint)
+		}
+	}
+
+	var staticAddr *wireguard.Address
+	if args.Address != "" {
+		staticAddr, err = wg.ParseAddress(args.Address)
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid address requested")
+		}
 	}
 
 	var machineId []byte
 	var key wireguard.Key
-	var availAddr *wireguard.Address
+	var addr *wireguard.Address
 	var listenPort int
 
-	ifaceLog, err := a.st.LastLogByDevice(deviceName, networkName)
+	ifaceLog, err := a.st.LastLogByDevice(args.Name, args.Network)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, errors.Wrapf(err, "failed to query last log by device %q network %q", deviceName, networkName)
+			return nil, errors.Wrapf(err, "failed to query last log by device %q network %q", args.Name, args.Network)
 		}
 		// No prior interface, let's create a new one to join.
 		machineId, err = MachineId()
@@ -214,16 +268,21 @@ func (a *Agent) JoinDevice(ctx context.Context, deviceName, networkName, endpoin
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to generate key")
 		}
-		// TODO: only really need to do this if we're starting a new network.
-		availNet, err := network.RandomSubnetV4()
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to find an available subnet")
+		if staticAddr == nil {
+			// Choose a new address from a randomly selected subnet
+			// TODO: only really need to do this if we're starting a new network.
+			availNet, err := network.RandomSubnetV4()
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to find an available subnet")
+			}
+			addr, err = wg.ParseAddress(availNet)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to parse network %q", availNet)
+			}
+		} else {
+			addr = staticAddr
 		}
-		availAddr, err = wg.ParseAddress(availNet)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse network %q", availNet)
-		}
-		listenPort, err = findListenPort(endpoint)
+		listenPort, err = findListenPort(args.Endpoint)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to find an available listen port")
 		}
@@ -237,7 +296,7 @@ func (a *Agent) JoinDevice(ctx context.Context, deviceName, networkName, endpoin
 			return nil, errors.Wrap(err, "cannot determine machine ID")
 		}
 		key = ifaceLog.Key
-		availAddr = &ifaceLog.Device.Addr
+		addr = &ifaceLog.Device.Addr
 		listenPort = ifaceLog.ListenPort
 	}
 
@@ -245,13 +304,14 @@ func (a *Agent) JoinDevice(ctx context.Context, deviceName, networkName, endpoin
 
 	cl := a.newApi(a.apiUrl)
 	joinResp, err := cl.JoinDevice(ctx, &api.JoinDeviceRequest{
-		Name:          deviceName,
-		Network:       networkName,
+		Name:          args.Name,
+		Network:       args.Network,
 		MachineId:     machineId,
 		Key:           key.PublicKey(),
-		Endpoint:      endpoint,
-		AvailableAddr: *availAddr,
+		Endpoint:      args.Endpoint,
+		AvailableAddr: *addr,
 		AvailablePort: listenPort,
+		StaticAddr:    staticAddr,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to join device to network")
@@ -296,33 +356,39 @@ func (a *Agent) ifaceJoinDeviceResponse(iface *store.Interface, joinResp *api.Jo
 	}
 }
 
-func (a *Agent) RefreshDevice(ctx context.Context, deviceName, networkName, endpoint string) (*store.Interface, error) {
+func (a *Agent) RefreshDevice(ctx context.Context, args JoinArgs) (*store.Interface, error) {
+	if a.readOnly {
+		return nil, errors.WithStack(ErrWritePermissions)
+	}
 	var err error
-	if deviceName == "" {
-		deviceName, err = os.Hostname()
+	if args.Name == "" {
+		args.Name, err = os.Hostname()
 		if err != nil {
 			return nil, errors.Wrap(err, "cannot determine hostname, node name is required")
 		}
 	}
 
-	if networkName == "" {
-		networkName = "default"
+	if args.Network == "" {
+		args.Network = "default"
 	}
 
-	ifaceLog, err := a.st.LastLogByDevice(deviceName, networkName)
+	ifaceLog, err := a.st.LastLogByDevice(args.Name, args.Network)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errors.Wrapf(ErrDeviceNotFound, "device %q network %q", deviceName, networkName)
+			return nil, errors.Wrapf(ErrDeviceNotFound, "device %q network %q", args.Name, args.Network)
 		}
 		return nil, errors.WithStack(err)
 	}
-	return a.RefreshInterface(ctx, ifaceLog, endpoint)
+	return a.RefreshInterface(ctx, ifaceLog, args.Endpoint)
 }
 
 func (a *Agent) RefreshInterface(ctx context.Context, iface *store.InterfaceWithLog, endpoint string) (*store.Interface, error) {
+	if a.readOnly {
+		return nil, errors.WithStack(ErrWritePermissions)
+	}
 	// If there is an unapplied operation pending, let's try to apply it now.
 	if iface.Log.Dirty {
-		err := a.ApplyInterfaceChanges(&iface.Interface)
+		err := a.ApplyInterfaceChanges(ctx, &iface.Interface)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -342,7 +408,7 @@ func (a *Agent) RefreshInterface(ctx context.Context, iface *store.InterfaceWith
 		Endpoint: endpoint,
 	})
 	if err != nil {
-		if errors.Is(err, api.ErrApiForbidden) {
+		if errors.Is(err, api.ErrApiRevoked) {
 			return a.revokedInterface(ctx, iface)
 		}
 		return nil, errors.WithStack(err)
@@ -429,6 +495,9 @@ func (a *Agent) allowOperation(l *store.InterfaceLog, op store.Operation) error 
 }
 
 func (a *Agent) DeleteDevice(ctx context.Context, deviceName, networkName string) (*store.Interface, error) {
+	if a.readOnly {
+		return nil, errors.WithStack(ErrWritePermissions)
+	}
 	var err error
 	if deviceName == "" {
 		deviceName, err = os.Hostname()
@@ -496,7 +565,10 @@ func (a *Agent) Interfaces() ([]store.InterfaceWithLog, error) {
 	return ifaces, nil
 }
 
-func (a *Agent) ApplyInterfaceChanges(iface *store.Interface) error {
+func (a *Agent) ApplyInterfaceChanges(ctx context.Context, iface *store.Interface) error {
+	if a.readOnly {
+		return errors.WithStack(ErrWritePermissions)
+	}
 	err := a.st.WithLog(iface, func(tx *sql.Tx, lastLog *store.InterfaceLog) error {
 		if !lastLog.Dirty {
 			return nil
@@ -511,12 +583,21 @@ func (a *Agent) ApplyInterfaceChanges(iface *store.Interface) error {
 			}
 		}
 		err = store.AppendLogTx(tx, iface, nextLog.Operation, nextLog.State, nextLog.Dirty, nextLog.Message)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		a.wc.applyState(ctx, iface.Id, nextLog.State)
 		return errors.WithStack(err)
 	})
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func (a *Agent) EnsureInterfaceState(iface *store.Interface, log *store.InterfaceLog) error {
+	_, err := a.applyInterfaceChanges(iface, log)
+	return errors.WithStack(err)
 }
 
 func (a *Agent) applyInterfaceChanges(iface *store.Interface, lastLog *store.InterfaceLog) (*store.InterfaceLog, error) {

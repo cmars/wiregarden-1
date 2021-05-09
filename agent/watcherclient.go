@@ -18,15 +18,23 @@ import (
 	"os"
 
 	"github.com/juju/zaputil/zapctx"
+	"github.com/wiregarden-io/wiregarden/agent/store"
 	"go.uber.org/zap"
 )
 
 func WatcherLockPath() string {
-	return os.TempDir() + "/.wiregarden.watcher.lock"
+	return runDir() + "/.wiregarden.watcher.lock"
 }
 
 func WatcherSockPath() string {
-	return os.TempDir() + "/.wiregarden.watcher.sock"
+	return runDir() + "/.wiregarden.watcher.sock"
+}
+
+func runDir() string {
+	if snapData := os.Getenv("SNAP_DATA"); snapData != "" {
+		return snapData
+	}
+	return "/var/run"
 }
 
 type watcherClient struct {
@@ -37,11 +45,21 @@ func newWatcherClient() *watcherClient {
 	return &watcherClient{
 		http.Client{
 			Transport: &http.Transport{
-				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-					return net.Dial("unix", WatcherSockPath())
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					dialer := net.Dialer{}
+					return dialer.DialContext(ctx, "unix", WatcherSockPath())
 				},
 			},
 		},
+	}
+}
+
+func (c *watcherClient) applyState(ctx context.Context, id int64, state store.State) {
+	switch state {
+	case store.StateInterfaceUp:
+		c.ensureWatch(ctx, id)
+	case store.StateInterfaceDown:
+		c.deleteWatch(ctx, id)
 	}
 }
 

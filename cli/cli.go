@@ -18,22 +18,25 @@ import (
 	stdlog "log"
 	"net"
 	"os"
-	"os/exec"
+	"sort"
 	"syscall"
 
+	"github.com/google/uuid"
 	"github.com/gosuri/uitable"
 	"github.com/juju/zaputil/zapctx"
 	"github.com/nightlyone/lockfile"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh/terminal"
 
 	"github.com/wiregarden-io/wiregarden/agent"
 	"github.com/wiregarden-io/wiregarden/agent/store"
 	"github.com/wiregarden-io/wiregarden/api"
+	"github.com/wiregarden-io/wiregarden/daemon"
 	"github.com/wiregarden-io/wiregarden/log"
-	"github.com/wiregarden-io/wiregarden/watcher"
+	"github.com/wiregarden-io/wiregarden/setup"
 )
 
 var debug bool
@@ -51,8 +54,9 @@ var CommandLine = cli.App{
 		Name: "up",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "name"},
-			&cli.StringFlag{Name: "network"},
+			&cli.StringFlag{Name: "network", Aliases: []string{"net"}},
 			&cli.StringFlag{Name: "endpoint"},
+			&cli.StringFlag{Name: "address", Aliases: []string{"addr"}},
 		},
 		Action: func(c *cli.Context) error {
 			if endpoint := c.String("endpoint"); endpoint != "" {
@@ -70,11 +74,16 @@ var CommandLine = cli.App{
 				return errors.WithStack(err)
 			}
 			ctx := NewLoggerContext(c)
-			iface, err := a.JoinDevice(agent.WithToken(ctx, token), c.String("name"), c.String("network"), c.String("endpoint"))
+			iface, err := a.JoinDevice(agent.WithToken(ctx, token), agent.JoinArgs{
+				Name:     c.String("name"),
+				Network:  c.String("network"),
+				Endpoint: c.String("endpoint"),
+				Address:  c.String("address"),
+			})
 			if err != nil {
 				return errors.WithStack(err)
 			}
-			err = a.ApplyInterfaceChanges(iface)
+			err = a.ApplyInterfaceChanges(ctx, iface)
 			if err != nil {
 				return errors.WithStack(err)
 			}
@@ -82,14 +91,13 @@ var CommandLine = cli.App{
 				zap.String("device", iface.Device.Name),
 				zap.String("network", iface.Network.Name),
 				zap.String("address", iface.Device.Addr.String()))
-			ensureWatcherLaunch(ctx)
 			return nil
 		},
 	}, {
 		Name: "down",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "name"},
-			&cli.StringFlag{Name: "network"},
+			&cli.StringFlag{Name: "network", Aliases: []string{"net"}},
 		},
 		Action: func(c *cli.Context) error {
 			a, err := agent.New(c.Path("datadir"), c.String("url"), agent.NotifyWatcher)
@@ -101,7 +109,7 @@ var CommandLine = cli.App{
 			if err != nil {
 				return errors.WithStack(err)
 			}
-			err = a.ApplyInterfaceChanges(iface)
+			err = a.ApplyInterfaceChanges(ctx, iface)
 			if err != nil {
 				return errors.WithStack(err)
 			}
@@ -114,7 +122,7 @@ var CommandLine = cli.App{
 		Name: "refresh",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "name"},
-			&cli.StringFlag{Name: "network"},
+			&cli.StringFlag{Name: "network", Aliases: []string{"net"}},
 			&cli.StringFlag{Name: "endpoint"},
 		},
 		Action: func(c *cli.Context) error {
@@ -136,6 +144,9 @@ var CommandLine = cli.App{
 				}
 				var lastErr error
 				for i := range ifaces {
+					if ifaces[i].Log.State == store.StateInterfaceDown {
+						continue
+					}
 					iface, err := a.RefreshInterface(ctx, &ifaces[i], "")
 					if err != nil {
 						zapctx.Warn(ctx, "refresh failed",
@@ -147,7 +158,7 @@ var CommandLine = cli.App{
 						lastErr = err
 						continue
 					}
-					err = a.ApplyInterfaceChanges(iface)
+					err = a.ApplyInterfaceChanges(ctx, iface)
 					if err != nil {
 						zapctx.Warn(ctx, "failed to apply interface changes",
 							zap.String("interface", ifaces[i].Name()),
@@ -169,18 +180,21 @@ var CommandLine = cli.App{
 				}
 				return lastErr
 			}
-			iface, err := a.RefreshDevice(ctx, c.String("name"), c.String("network"), c.String("endpoint"))
+			iface, err := a.RefreshDevice(ctx, agent.JoinArgs{
+				Name:     c.String("name"),
+				Network:  c.String("network"),
+				Endpoint: c.String("endpoint"),
+			})
 			if err != nil {
 				return errors.WithStack(err)
 			}
-			err = a.ApplyInterfaceChanges(iface)
+			err = a.ApplyInterfaceChanges(ctx, iface)
 			if err != nil {
 				return errors.WithStack(err)
 			}
 			zapctx.Info(ctx, "refreshed",
 				zap.String("device", iface.Device.Name),
 				zap.String("network", iface.Network.Name))
-			ensureWatcherLaunch(ctx)
 			return nil
 		},
 	}, {
@@ -190,7 +204,6 @@ var CommandLine = cli.App{
 			&cli.BoolFlag{Name: "down"},
 		},
 		Action: func(c *cli.Context) error {
-			ctx := NewLoggerContext(c)
 			a, err := agent.New(c.Path("datadir"), c.String("url"))
 			if err != nil {
 				return errors.WithStack(err)
@@ -200,71 +213,138 @@ var CommandLine = cli.App{
 				return errors.WithStack(err)
 			}
 			printStatus(ifaces, c.Bool("json"), c.Bool("down"))
-			ensureWatcherLaunch(ctx)
 			return nil
 		},
 	}, {
-		Name:   "watcher",
-		Hidden: true,
-		Flags:  []cli.Flag{},
-		Action: func(c *cli.Context) error {
-			lf, err := lockfile.New(agent.WatcherLockPath())
-			if err != nil {
-				return errors.Wrap(err, "failed to create lock file handle")
-			}
-			if err := lf.TryLock(); err != nil {
-				return errors.Wrap(err, "failed to obtain lock file")
-			}
-			a, err := agent.New(c.Path("datadir"), c.String("url"))
-			if err != nil {
-				return errors.Wrap(err, "failed to create agent")
-			}
-			w := watcher.New(a)
-			ctx := NewLoggerContext(c)
-			err = w.Start(ctx)
-			if err != nil {
-				return errors.Wrap(err, "failed to start watcher")
-			}
-			<-chan struct{}(nil)
-			w.Wait(ctx)
-			return nil
-		},
-	}, {
-		Name: "list",
-		Action: func(c *cli.Context) error {
-			cl := api.New(c.String("url"))
-			token, err := GetToken("WIREGARDEN_SUBSCRIPTION", "Subscription")
-			if err != nil {
-				return errors.WithStack(err)
-			}
-			resp, err := cl.ListDevices(agent.WithToken(NewLoggerContext(c), token))
-			if err != nil {
-				return errors.WithStack(err)
-			}
-			return PrintJson(resp)
-		},
-	}, {
-		Name: "delete",
+		Name: "setup",
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "device"},
-			&cli.StringFlag{Name: "network"},
+			&cli.BoolFlag{Name: "nss-plugin", Value: true},
 		},
 		Action: func(c *cli.Context) error {
-			if (c.String("device") == "") == (c.String("network") == "") {
-				return errors.New("specify one of --device or --network options")
+			if os.Getuid() != 0 {
+				return errors.New("must be run as root")
 			}
-			cl := api.New(c.String("url"))
-			token, err := GetToken("WIREGARDEN_SUBSCRIPTION", "Subscription")
+			ctx := NewLoggerContext(c)
+			var merr []error
+			err := setup.EnsureWireguardInstalled(ctx)
 			if err != nil {
-				return errors.WithStack(err)
+				merr = append(merr, err)
+				fmt.Println(setup.ManualPackageInstructions)
 			}
-			if device := c.String("device"); device != "" {
-				err = cl.DeleteDevice(agent.WithToken(NewLoggerContext(c), token), device)
-			} else if network := c.String("network"); network != "" {
-				err = cl.DeleteNetwork(agent.WithToken(NewLoggerContext(c), token), network)
+			if c.Bool("nss-plugin") {
+				err = setup.EnsureNssPluginInstalled(ctx)
+				if errors.Is(err, setup.ErrUnsupportedPlatform) {
+					fmt.Println(setup.ManualNssInstructions)
+				} else if err != nil {
+					merr = append(merr, err)
+				}
 			}
-			return errors.WithStack(err)
+			err = daemon.Install()
+			if err != nil {
+				merr = append(merr, err)
+				fmt.Println(daemon.FailedServiceNotice)
+			}
+			if len(merr) > 0 {
+				fmt.Println("There were errors during the installation:")
+			}
+			return multierr.Combine(merr...)
 		},
+	}, {
+		Name:   "daemon",
+		Hidden: true,
+		Subcommands: []*cli.Command{{
+			Name:  "run",
+			Flags: []cli.Flag{},
+			Action: func(c *cli.Context) error {
+				if os.Getuid() != 0 {
+					return errors.New("must be run as root")
+				}
+				lf, err := lockfile.New(agent.WatcherLockPath())
+				if err != nil {
+					return errors.Wrap(err, "failed to create lock file handle")
+				}
+				if err := lf.TryLock(); err != nil {
+					return errors.Wrap(err, "failed to obtain lock file")
+				}
+				a, err := agent.New(c.Path("datadir"), c.String("url"))
+				if err != nil {
+					return errors.Wrap(err, "failed to create agent")
+				}
+				w := daemon.New(a)
+				ctx := NewLoggerContext(c)
+				err = w.Start(ctx)
+				if err != nil {
+					return errors.Wrap(err, "failed to start daemon")
+				}
+				<-ctx.Done()
+				w.Shutdown(ctx)
+				return nil
+			},
+		}, {
+			Name:  "install",
+			Flags: []cli.Flag{},
+			Action: func(c *cli.Context) error {
+				if os.Getuid() != 0 {
+					return errors.New("must be run as root")
+				}
+				return errors.WithStack(daemon.Install())
+			},
+		}, {
+			Name:  "uninstall",
+			Flags: []cli.Flag{},
+			Action: func(c *cli.Context) error {
+				if os.Getuid() != 0 {
+					return errors.New("must be run as root")
+				}
+				ctx := NewLoggerContext(c)
+				return errors.WithStack(daemon.Uninstall(ctx))
+			},
+		}},
+	}, {
+		Name: "devices",
+		Subcommands: []*cli.Command{{
+			Name: "list",
+			Action: func(c *cli.Context) error {
+				cl := api.New(c.String("url"))
+				token, err := GetToken("WIREGARDEN_SUBSCRIPTION", "Subscription")
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				resp, err := cl.ListDevices(agent.WithToken(NewLoggerContext(c), token))
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				return PrintJson(resp)
+			},
+		}, {
+			Name: "delete",
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "device"},
+				&cli.StringFlag{Name: "network"},
+			},
+			Action: func(c *cli.Context) error {
+				if (c.String("device") == "") == (c.String("network") == "") {
+					return errors.New("specify one of --device or --network options")
+				}
+				cl := api.New(c.String("url"))
+				token, err := GetToken("WIREGARDEN_SUBSCRIPTION", "Subscription")
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				if device := c.String("device"); device != "" {
+					if _, err := uuid.Parse(device); err != nil {
+						return errors.Wrap(err, "invalid device id")
+					}
+					err = cl.DeleteDevice(agent.WithToken(NewLoggerContext(c), token), device)
+				} else if network := c.String("network"); network != "" {
+					if _, err := uuid.Parse(network); err != nil {
+						return errors.Wrap(err, "invalid network id")
+					}
+					err = cl.DeleteNetwork(agent.WithToken(NewLoggerContext(c), token), network)
+				}
+				return errors.WithStack(err)
+			},
+		}},
 	}, {
 		Name: "version",
 		Action: func(c *cli.Context) error {
@@ -287,6 +367,21 @@ var CommandLine = cli.App{
 					return errors.WithStack(err)
 				}
 				resp, err := cl.GetSubscriptionToken(agent.WithToken(NewLoggerContext(c), token), c.String("plan"))
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				return PrintJson(resp)
+			},
+		}, {
+			Name:    "list-subscriptions",
+			Aliases: []string{"list-subs"},
+			Action: func(c *cli.Context) error {
+				cl := api.New(c.String("url"))
+				token, err := GetToken("WIREGARDEN_USER", "User")
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				resp, err := cl.ListSubscriptions(agent.WithToken(NewLoggerContext(c), token))
 				if err != nil {
 					return errors.WithStack(err)
 				}
@@ -347,7 +442,24 @@ func ReadPassword(prompt string) (string, error) {
 	return string(pass), nil
 }
 
+type sortedInterfaces []store.InterfaceWithLog
+
+func (si sortedInterfaces) Len() int      { return len(si) }
+func (si sortedInterfaces) Swap(i, j int) { si[i], si[j] = si[j], si[i] }
+func (si sortedInterfaces) Less(i, j int) bool {
+	return si[i].Network.Name+si[i].Device.Name < si[j].Network.Name+"."+si[j].Device.Name
+}
+
+type sortedPeers []api.Device
+
+func (sp sortedPeers) Len() int      { return len(sp) }
+func (sp sortedPeers) Swap(i, j int) { sp[i], sp[j] = sp[j], sp[i] }
+func (sp sortedPeers) Less(i, j int) bool {
+	return sp[i].Id < sp[j].Id
+}
+
 func printStatus(ifaces []store.InterfaceWithLog, json, down bool) {
+	sort.Sort(sortedInterfaces(ifaces))
 	if json {
 		PrintJson(ifaces)
 	}
@@ -370,38 +482,15 @@ func printStatus(ifaces []store.InterfaceWithLog, json, down bool) {
 		fmt.Println()
 		table := uitable.New()
 		table.MaxColWidth = 50
-		table.AddRow("Network", "Peer", "Address", "Endpoint", "Key")
-		table.AddRow(iface.Network.Name, iface.Device.Name+" (this host)",
-			iface.Device.Addr.String(), iface.Device.Endpoint,
+		table.AddRow("Peer", "Address", "Endpoint", "Key")
+		table.AddRow(iface.Device.Name+"."+iface.Network.Name+" (this host)",
+			iface.Device.Addr.IP.String(), iface.Device.Endpoint,
 			iface.Device.PublicKey.String())
+		sort.Sort(sortedPeers(iface.Peers))
 		for _, peer := range iface.Peers {
-			table.AddRow(iface.Network.Name, peer.Name,
-				peer.Addr.String(), peer.Endpoint, peer.PublicKey.String())
+			table.AddRow(peer.Name+"."+iface.Network.Name,
+				peer.Addr.IP.String(), peer.Endpoint, peer.PublicKey.String())
 		}
 		fmt.Println(table)
 	}
-}
-
-func ensureWatcherLaunch(ctx context.Context) error {
-	var args []string
-	if debug {
-		args = append(args, "--debug")
-	}
-	args = append(args, "watcher")
-	zapctx.Debug(ctx, "launching watcher", zap.Strings("args", args))
-	cmd := exec.Command(os.Args[0], args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Foreground: false,
-		Setsid:     true,
-	}
-	zapctx.Debug(ctx, "cmd", zap.Reflect("cmd", cmd))
-	if err := cmd.Start(); err != nil {
-		zapctx.Warn(ctx, "failed to launch watcher", zap.Error(err))
-		return errors.Wrap(err, "failed to launch watcher")
-	}
-	if err := cmd.Process.Release(); err != nil {
-		zapctx.Warn(ctx, "failed to background watcher", zap.Error(err))
-		return errors.Wrap(err, "failed to background watcher")
-	}
-	return nil
 }

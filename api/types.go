@@ -24,18 +24,27 @@ type ListSubscriptionsResponse struct {
 }
 
 type GetSubscriptionResponse struct {
-	Id        string     `json:"id"`
+	Id        string      `json:"id"`
+	Created   time.Time   `json:"created"`
+	NotBefore *time.Time  `json:"notBefore"`
+	NotAfter  *time.Time  `json:"notAfter"`
+	Plan      PlanDoc     `json:"plan"`
+	Tokens    []TokenInfo `json:"tokens"`
+}
+
+type TokenInfo struct {
+	Token     []byte     `json:"token"`
 	Created   time.Time  `json:"created"`
 	NotBefore *time.Time `json:"notBefore"`
 	NotAfter  *time.Time `json:"notAfter"`
-	Plan      PlanDoc    `json:"plan"`
 }
 
 type PlanDoc struct {
-	Name          string `json:"name"`
-	Free          bool   `json:"free"`
-	DeviceLimit   int    `json:"deviceLimit"`
-	ExpiresInDays int    `json:"expiresInDays"`
+	Name                    string `json:"name"`
+	Free                    bool   `json:"free"`
+	DeviceLimit             int    `json:"deviceLimit,omitempty"`
+	ExpiresInDays           int    `json:"expiresInDays,omitempty"`
+	MaxDeviceUpdatesPerHour int    `json:"maxDeviceRefreshesPerHour,omitempty"`
 }
 
 type GetSubscriptionTokenResponse struct {
@@ -54,10 +63,12 @@ type JoinDeviceRequest struct {
 	Key wireguard.Key `json:"key"`
 	// Public endpoint where this device can be reached, if possible.
 	Endpoint string `json:"endpoint,omitempty"`
-	// Available address on this device. Only used if starting a new network.
+	// Available address on this device. Used if starting a new network.
 	AvailableAddr wireguard.Address `json:"availableAddr,omitempty"`
 	// Available port on this device.
 	AvailablePort int `json:"availablePort,omitempty"`
+	// Request a specific static address for this device.
+	StaticAddr *wireguard.Address `json:"staticAddr,omitempty"`
 }
 
 func (r *JoinDeviceRequest) Valid() error {
